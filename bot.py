@@ -1,147 +1,158 @@
 """
 InactivityGuard - Discord Bot
 Tracks per-user activity (messages + voice joins) and kicks after a configurable idle period.
-Uses slash commands (/) and stores state in activity_data.json.
+Uses slash commands (/) and stores state in Supabase (PostgreSQL).
 
 Requirements:
-    pip install discord.py
+    pip install discord.py supabase
 
-Setup:
-    1. Create a bot at https://discord.com/developers/applications
-    2. Enable SERVER MEMBERS INTENT and MESSAGE CONTENT INTENT under Bot → Privileged Gateway Intents
-    3. Invite the bot with scopes: bot + applications.commands
-       and permissions: Kick Members, View Channels, Read Message History
-    4. Paste your bot token below (or set the DISCORD_TOKEN env var)
+Env vars needed:
+    DISCORD_TOKEN   — your bot token
+    SUPABASE_URL    — from Supabase project settings
+    SUPABASE_KEY    — service_role key from Supabase project settings
 """
 
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
-import json
 import os
 import asyncio
 from datetime import datetime, timezone, timedelta
-from pathlib import Path
+from supabase import create_client, Client
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
-TOKEN = os.getenv("DISCORD_TOKEN", "YOUR_BOT_TOKEN_HERE")
-DATA_FILE = Path("activity_data.json")
+TOKEN           = os.getenv("DISCORD_TOKEN", "YOUR_BOT_TOKEN_HERE")
+SUPABASE_URL    = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY    = os.getenv("SUPABASE_KEY", "")
 
-# Default inactivity threshold (days) – changeable per-guild via /setup
-DEFAULT_INACTIVITY_DAYS = 30
-
-# How often (in hours) the bot automatically checks for inactive members
+DEFAULT_INACTIVITY_DAYS  = 30
 AUTO_CHECK_INTERVAL_HOURS = 24
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-# ─── PERSISTENCE ─────────────────────────────────────────────────────────────
-def load_data() -> dict:
-    if DATA_FILE.exists():
-        with open(DATA_FILE, "r") as f:
-            return json.load(f)
-    return {}
+# ─── SUPABASE CLIENT ─────────────────────────────────────────────────────────
+sb: Client = None
+
+def get_sb() -> Client:
+    global sb
+    if sb is None:
+        sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+    return sb
+# ─────────────────────────────────────────────────────────────────────────────
 
 
-def save_data(data: dict) -> None:
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+# ─── DB HELPERS ──────────────────────────────────────────────────────────────
 
-
-# Schema:
-# {
-#   "<guild_id>": {
-#     "inactivity_days": 30,
-#     "log_channel": null,          # channel id or null
-#     "exempt_roles": [],           # list of role ids never kicked
-#     "tracking_since": "ISO",      # when we started tracking this guild
-#     "users": {
-#       "<user_id>": "ISO datetime" # last_seen timestamp
-#     }
-#   }
-# }
-
-def guild_data(data: dict, guild_id: int) -> dict:
-    key = str(guild_id)
-    if key not in data:
-        data[key] = {
-            "inactivity_days": DEFAULT_INACTIVITY_DAYS,
-            "log_channel": None,
-            "exempt_roles": [],
-            "tracking_since": utcnow_iso(),
-            "users": {},
-        }
-    return data[key]
-
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 def utcnow_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return utcnow().isoformat()
 
 
-def iso_to_dt(iso: str) -> datetime:
-    return datetime.fromisoformat(iso)
+def get_guild_settings(guild_id: int) -> dict:
+    res = get_sb().table("guilds").select("*").eq("guild_id", str(guild_id)).execute()
+    if res.data:
+        return res.data[0]
+    row = {
+        "guild_id": str(guild_id),
+        "inactivity_days": DEFAULT_INACTIVITY_DAYS,
+        "log_channel": None,
+        "exempt_roles": [],
+        "tracking_since": utcnow_iso(),
+    }
+    get_sb().table("guilds").insert(row).execute()
+    return row
+
+
+def update_guild_settings(guild_id: int, **kwargs) -> None:
+    get_sb().table("guilds").upsert({"guild_id": str(guild_id), **kwargs}).execute()
+
+
+def set_last_seen(guild_id: int, user_id: int, dt: datetime = None) -> None:
+    iso = (dt or utcnow()).isoformat()
+    get_sb().table("activity").upsert({
+        "guild_id": str(guild_id),
+        "user_id":  str(user_id),
+        "last_seen": iso,
+    }).execute()
+
+
+def get_last_seen(guild_id: int, user_id: int) -> datetime | None:
+    res = (get_sb().table("activity")
+           .select("last_seen")
+           .eq("guild_id", str(guild_id))
+           .eq("user_id",  str(user_id))
+           .execute())
+    if res.data:
+        return datetime.fromisoformat(res.data[0]["last_seen"])
+    return None
+
+
+def get_all_activity(guild_id: int) -> dict:
+    res = (get_sb().table("activity")
+           .select("user_id,last_seen")
+           .eq("guild_id", str(guild_id))
+           .execute())
+    return {row["user_id"]: datetime.fromisoformat(row["last_seen"]) for row in res.data}
+
+
+def delete_user_activity(guild_id: int, user_id: int) -> None:
+    (get_sb().table("activity")
+     .delete()
+     .eq("guild_id", str(guild_id))
+     .eq("user_id",  str(user_id))
+     .execute())
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 # ─── BOT SETUP ───────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
-intents.members = True          # needed to iterate members & catch joins
-intents.message_content = True  # needed to read messages for activity
+intents.members = True
+intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
-data: dict = {}
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 # ─── HELPERS ─────────────────────────────────────────────────────────────────
-def update_user_activity(guild_id: int, user_id: int) -> None:
-    gd = guild_data(data, guild_id)
-    gd["users"][str(user_id)] = utcnow_iso()
-    save_data(data)
-
-
 def is_exempt(member: discord.Member, exempt_role_ids: list) -> bool:
-    """Returns True if the member should never be kicked."""
     if member.bot:
         return True
     if member.guild_permissions.administrator:
         return True
     member_role_ids = {r.id for r in member.roles}
-    return bool(member_role_ids & set(exempt_role_ids))
+    return bool(member_role_ids & set(int(r) for r in exempt_role_ids))
 
 
-async def get_inactive_members(guild: discord.Guild) -> list[tuple[discord.Member, datetime]]:
-    """Returns list of (member, last_seen_dt) for members past the threshold."""
-    gd = guild_data(data, guild.id)
-    threshold_days = gd["inactivity_days"]
-    exempt_roles = gd["exempt_roles"]
-    cutoff = datetime.now(timezone.utc) - timedelta(days=threshold_days)
-    tracking_since = iso_to_dt(gd["tracking_since"])
+async def get_inactive_members(guild: discord.Guild) -> list:
+    settings = get_guild_settings(guild.id)
+    threshold_days = settings["inactivity_days"]
+    exempt_roles   = settings.get("exempt_roles") or []
+    cutoff         = utcnow() - timedelta(days=threshold_days)
+    tracking_since = datetime.fromisoformat(settings["tracking_since"])
 
+    activity = get_all_activity(guild.id)
     inactive = []
+
     for member in guild.members:
         if is_exempt(member, exempt_roles):
             continue
-
-        last_seen_iso = gd["users"].get(str(member.id))
-        if last_seen_iso:
-            last_seen = iso_to_dt(last_seen_iso)
-        else:
-            # Never seen — use whichever is later: join date or tracking start
+        last_seen = activity.get(str(member.id))
+        if not last_seen:
             join = member.joined_at or tracking_since
             last_seen = max(join, tracking_since)
-
         if last_seen < cutoff:
             inactive.append((member, last_seen))
 
-    inactive.sort(key=lambda x: x[1])  # oldest first
+    inactive.sort(key=lambda x: x[1])
     return inactive
 
 
 async def send_log(guild: discord.Guild, message: str) -> None:
-    gd = guild_data(data, guild.id)
-    if gd["log_channel"]:
-        ch = guild.get_channel(int(gd["log_channel"]))
+    settings = get_guild_settings(guild.id)
+    if settings.get("log_channel"):
+        ch = guild.get_channel(int(settings["log_channel"]))
         if ch:
             try:
                 await ch.send(message)
@@ -153,34 +164,23 @@ async def send_log(guild: discord.Guild, message: str) -> None:
 # ─── EVENTS ──────────────────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
-    global data
-    data = load_data()
     print(f"[InactivityGuard] Logged in as {bot.user} (ID: {bot.user.id})")
-
-    # Seed join dates for all members we haven't tracked yet
     for guild in bot.guilds:
-        gd = guild_data(data, guild.id)
-        changed = False
+        activity = get_all_activity(guild.id)
+        seeded = 0
         for member in guild.members:
             if member.bot:
                 continue
-            uid = str(member.id)
-            # Always seed if missing — join date is better than nothing
-            if uid not in gd["users"] and member.joined_at:
-                gd["users"][uid] = member.joined_at.isoformat()
-                changed = True
-        if changed:
-            save_data(data)
-        print(f"  • {guild.name} — seeded {sum(1 for m in guild.members if not m.bot)} members")
-        print(f"  • {guild.name} — tracking {len(gd['users'])} members, "
-              f"threshold: {gd['inactivity_days']}d")
-
+            if str(member.id) not in activity and member.joined_at:
+                set_last_seen(guild.id, member.id, member.joined_at)
+                seeded += 1
+        settings = get_guild_settings(guild.id)
+        print(f"  • {guild.name} — seeded {seeded} members, threshold: {settings['inactivity_days']}d")
     try:
         synced = await bot.tree.sync()
-        print(f"[InactivityGuard] Synced {len(synced)} slash commands globally.")
+        print(f"[InactivityGuard] Synced {len(synced)} slash commands.")
     except Exception as e:
         print(f"[InactivityGuard] Sync error: {e}")
-
     auto_kick_check.start()
 
 
@@ -188,113 +188,94 @@ async def on_ready():
 async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
-    update_user_activity(message.guild.id, message.author.id)
+    set_last_seen(message.guild.id, message.author.id)
     await bot.process_commands(message)
 
 
 @bot.event
-async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-    """Fires whenever someone's voice state changes. Joining/switching counts as activity."""
+async def on_voice_state_update(member: discord.Member, before, after):
     if member.bot:
         return
-    if after.channel is not None:  # they are now in a channel (joined or moved)
-        update_user_activity(member.guild.id, member.id)
+    if after.channel is not None:
+        set_last_seen(member.guild.id, member.id)
 
 
 @bot.event
 async def on_member_join(member: discord.Member):
     if member.bot:
         return
-    update_user_activity(member.guild.id, member.id)
+    set_last_seen(member.guild.id, member.id)
 
 
 @bot.event
 async def on_member_remove(member: discord.Member):
-    """Clean up data when someone leaves."""
     if member.guild:
-        gd = guild_data(data, member.guild.id)
-        gd["users"].pop(str(member.id), None)
-        save_data(data)
+        delete_user_activity(member.guild.id, member.id)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 # ─── BACKGROUND TASK ─────────────────────────────────────────────────────────
 @tasks.loop(hours=AUTO_CHECK_INTERVAL_HOURS)
 async def auto_kick_check():
-    """Runs every AUTO_CHECK_INTERVAL_HOURS and kicks inactive members in all guilds."""
     await bot.wait_until_ready()
     for guild in bot.guilds:
-        gd = guild_data(data, guild.id)
-        if not gd.get("log_channel"):
-            continue  # don't auto-kick unless a log channel is configured
-
+        settings = get_guild_settings(guild.id)
+        if not settings.get("log_channel"):
+            continue
         inactive = await get_inactive_members(guild)
         if not inactive:
             continue
-
         kicked, failed = 0, 0
         for member, last_seen in inactive:
-            days_ago = (datetime.now(timezone.utc) - last_seen).days
+            days_ago = (utcnow() - last_seen).days
             try:
                 await member.kick(reason=f"[InactivityGuard] Inactive for {days_ago} days.")
                 kicked += 1
                 await send_log(guild,
-                    f"👢 Auto-kicked **{member}** — last seen **{days_ago}d ago** "
-                    f"({last_seen.strftime('%Y-%m-%d')})")
+                    f"👢 Auto-kicked **{member}** — last seen **{days_ago}d ago** ({last_seen.strftime('%Y-%m-%d')})")
             except discord.Forbidden:
                 failed += 1
             except Exception as e:
                 failed += 1
                 print(f"Auto-kick error ({member}): {e}")
-
         await send_log(guild,
-            f"✅ Auto-check complete — kicked **{kicked}** member(s)"
-            + (f", failed to kick **{failed}** (permissions?)" if failed else "."))
+            f"✅ Auto-check complete — kicked **{kicked}**" + (f", failed **{failed}**" if failed else "."))
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-# ─── PERMISSION CHECK ────────────────────────────────────────────────────────
-# Use the built-in decorator — applied per-command as:
-#   @app_commands.checks.has_permissions(administrator=True)
-# Error responses are handled by the global error handler below.
-
+# ─── ERROR HANDLER ───────────────────────────────────────────────────────────
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message(
             "❌ You need **Administrator** permission to use this command.", ephemeral=True)
     else:
-        await interaction.response.send_message(
-            f"❌ An error occurred: {error}", ephemeral=True)
+        await interaction.response.send_message(f"❌ Error: {error}", ephemeral=True)
         raise error
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-# ─── SLASH COMMANDS ───────────────────────────────────────────────────────────
+# ─── SLASH COMMANDS ──────────────────────────────────────────────────────────
 
-# /setup
 @bot.tree.command(name="setup", description="Configure InactivityGuard for this server.")
 @app_commands.describe(
-    inactivity_days="Days of inactivity before a member is eligible for kicking (default 30).",
+    inactivity_days="Days of inactivity before a member is eligible for kicking.",
     log_channel="Channel where kick logs are posted (also enables auto-kicking).",
 )
 @app_commands.checks.has_permissions(administrator=True)
-async def setup(
-    interaction: discord.Interaction,
-    inactivity_days: int = DEFAULT_INACTIVITY_DAYS,
-    log_channel: discord.TextChannel = None,
-):
-    gd = guild_data(data, interaction.guild_id)
-    gd["inactivity_days"] = max(1, inactivity_days)
-    if log_channel:
-        gd["log_channel"] = log_channel.id
-    save_data(data)
-
+async def setup(interaction: discord.Interaction,
+                inactivity_days: int = DEFAULT_INACTIVITY_DAYS,
+                log_channel: discord.TextChannel = None):
+    update_guild_settings(
+        interaction.guild_id,
+        inactivity_days=max(1, inactivity_days),
+        log_channel=str(log_channel.id) if log_channel else None,
+    )
+    settings = get_guild_settings(interaction.guild_id)
     lines = [
         "✅ **InactivityGuard configured!**",
-        f"• Inactivity threshold: **{gd['inactivity_days']} days**",
+        f"• Inactivity threshold: **{settings['inactivity_days']} days**",
         f"• Log channel: {log_channel.mention if log_channel else '*(none — auto-kick disabled)*'}",
-        f"• Tracking since: `{gd['tracking_since'][:10]}`",
         "",
         "Use `/exempt_role` to protect roles from being kicked.",
         "Use `/check_inactive` to preview who would be kicked.",
@@ -303,7 +284,6 @@ async def setup(
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
-# /set_threshold
 @bot.tree.command(name="set_threshold", description="Change the inactivity kick threshold.")
 @app_commands.describe(days="Kick members inactive for this many days.")
 @app_commands.checks.has_permissions(administrator=True)
@@ -311,30 +291,23 @@ async def set_threshold(interaction: discord.Interaction, days: int):
     if days < 1:
         await interaction.response.send_message("❌ Must be at least 1 day.", ephemeral=True)
         return
-    gd = guild_data(data, interaction.guild_id)
-    gd["inactivity_days"] = days
-    save_data(data)
-    await interaction.response.send_message(
-        f"✅ Inactivity threshold updated to **{days} days**.", ephemeral=True)
+    update_guild_settings(interaction.guild_id, inactivity_days=days)
+    await interaction.response.send_message(f"✅ Threshold updated to **{days} days**.", ephemeral=True)
 
 
-# /set_log_channel
-@bot.tree.command(name="set_log_channel", description="Set (or clear) the log channel. Setting one enables auto-kicking.")
+@bot.tree.command(name="set_log_channel", description="Set or clear the log channel.")
 @app_commands.describe(channel="Text channel for logs. Leave empty to disable auto-kicking.")
 @app_commands.checks.has_permissions(administrator=True)
 async def set_log_channel(interaction: discord.Interaction, channel: discord.TextChannel = None):
-    gd = guild_data(data, interaction.guild_id)
-    gd["log_channel"] = channel.id if channel else None
-    save_data(data)
+    update_guild_settings(interaction.guild_id, log_channel=str(channel.id) if channel else None)
     if channel:
         await interaction.response.send_message(
-            f"✅ Log channel set to {channel.mention}. Auto-kicking is **enabled**.", ephemeral=True)
+            f"✅ Log channel set to {channel.mention}. Auto-kicking **enabled**.", ephemeral=True)
     else:
         await interaction.response.send_message(
-            "✅ Log channel cleared. Auto-kicking is **disabled**.", ephemeral=True)
+            "✅ Log channel cleared. Auto-kicking **disabled**.", ephemeral=True)
 
 
-# /exempt_role
 @bot.tree.command(name="exempt_role", description="Add or remove a role from the kick-exempt list.")
 @app_commands.describe(role="The role to toggle.", action="Add or remove the exemption.")
 @app_commands.choices(action=[
@@ -343,69 +316,61 @@ async def set_log_channel(interaction: discord.Interaction, channel: discord.Tex
 ])
 @app_commands.checks.has_permissions(administrator=True)
 async def exempt_role(interaction: discord.Interaction, role: discord.Role, action: str):
-    gd = guild_data(data, interaction.guild_id)
-    exempt = gd["exempt_roles"]
-    rid = role.id
+    settings = get_guild_settings(interaction.guild_id)
+    exempt = list(settings.get("exempt_roles") or [])
+    rid = str(role.id)
     if action == "add":
         if rid not in exempt:
             exempt.append(rid)
         msg = f"✅ {role.mention} is now **exempt** from inactivity kicks."
     else:
-        exempt[:] = [r for r in exempt if r != rid]
+        exempt = [r for r in exempt if r != rid]
         msg = f"✅ {role.mention} is **no longer exempt**."
-    save_data(data)
+    update_guild_settings(interaction.guild_id, exempt_roles=exempt)
     await interaction.response.send_message(msg, ephemeral=True)
 
 
-# /status
 @bot.tree.command(name="status", description="Show InactivityGuard's current configuration.")
 async def status(interaction: discord.Interaction):
-    gd = guild_data(data, interaction.guild_id)
+    settings = get_guild_settings(interaction.guild_id)
     guild = interaction.guild
-
-    log_ch = guild.get_channel(int(gd["log_channel"])) if gd["log_channel"] else None
+    log_ch = guild.get_channel(int(settings["log_channel"])) if settings.get("log_channel") else None
     exempt_mentions = []
-    for rid in gd["exempt_roles"]:
-        r = guild.get_role(rid)
+    for rid in (settings.get("exempt_roles") or []):
+        r = guild.get_role(int(rid))
         if r:
             exempt_mentions.append(r.mention)
-
+    activity = get_all_activity(interaction.guild_id)
     lines = [
         "📊 **InactivityGuard Status**",
-        f"• Threshold: **{gd['inactivity_days']} days**",
+        f"• Threshold: **{settings['inactivity_days']} days**",
         f"• Log channel: {log_ch.mention if log_ch else '*(none)*'}",
         f"• Auto-kick: {'✅ enabled' if log_ch else '❌ disabled'}",
         f"• Exempt roles: {', '.join(exempt_mentions) if exempt_mentions else '*(none)*'}",
-        f"• Members tracked: **{len(gd['users'])}**",
-        f"• Tracking since: `{gd['tracking_since'][:10]}`",
+        f"• Members tracked: **{len(activity)}**",
+        f"• Tracking since: `{settings['tracking_since'][:10]}`",
     ]
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
-# /check_inactive
-@bot.tree.command(name="check_inactive", description="Preview who would be kicked right now (no one is actually kicked).")
+@bot.tree.command(name="check_inactive", description="Preview who would be kicked right now (no action taken).")
 @app_commands.describe(days="Override threshold for this check only (optional).")
 @app_commands.checks.has_permissions(administrator=True)
 async def check_inactive(interaction: discord.Interaction, days: int = None):
     await interaction.response.defer(ephemeral=True)
-
-    gd = guild_data(data, interaction.guild_id)
-    override = days or gd["inactivity_days"]
-
-    # Temporarily override for the check
-    original = gd["inactivity_days"]
-    gd["inactivity_days"] = override
+    settings = get_guild_settings(interaction.guild_id)
+    override = days or settings["inactivity_days"]
+    original = settings["inactivity_days"]
+    update_guild_settings(interaction.guild_id, inactivity_days=override)
     inactive = await get_inactive_members(interaction.guild)
-    gd["inactivity_days"] = original
-
+    update_guild_settings(interaction.guild_id, inactivity_days=original)
     if not inactive:
         await interaction.followup.send(
             f"✅ No members inactive for **{override}+ days**. Server is clean!", ephemeral=True)
         return
-
     lines = [f"⚠️ **{len(inactive)} member(s) inactive for {override}+ days:**\n"]
-    for member, last_seen in inactive[:25]:   # cap at 25 for readability
-        days_ago = (datetime.now(timezone.utc) - last_seen).days
+    for member, last_seen in inactive[:25]:
+        days_ago = (utcnow() - last_seen).days
         lines.append(f"• {member.mention} — last seen **{days_ago}d ago** (`{last_seen.strftime('%Y-%m-%d')}`)")
     if len(inactive) > 25:
         lines.append(f"…and **{len(inactive) - 25}** more.")
@@ -413,107 +378,85 @@ async def check_inactive(interaction: discord.Interaction, days: int = None):
     await interaction.followup.send("\n".join(lines), ephemeral=True)
 
 
-# /kick_inactive
-@bot.tree.command(name="kick_inactive", description="Kick all members who have been inactive past the threshold.")
+@bot.tree.command(name="kick_inactive", description="Kick all members inactive past the threshold.")
 @app_commands.describe(
     days="Override threshold for this kick only (optional).",
-    dry_run="If True, show what would happen without actually kicking anyone.",
+    dry_run="Show what would happen without actually kicking anyone.",
 )
 @app_commands.checks.has_permissions(administrator=True)
-async def kick_inactive(
-    interaction: discord.Interaction,
-    days: int = None,
-    dry_run: bool = False,
-):
+async def kick_inactive(interaction: discord.Interaction, days: int = None, dry_run: bool = False):
     await interaction.response.defer(ephemeral=True)
-
-    gd = guild_data(data, interaction.guild_id)
-    override = days or gd["inactivity_days"]
-
-    original = gd["inactivity_days"]
-    gd["inactivity_days"] = override
+    settings = get_guild_settings(interaction.guild_id)
+    override = days or settings["inactivity_days"]
+    original = settings["inactivity_days"]
+    update_guild_settings(interaction.guild_id, inactivity_days=override)
     inactive = await get_inactive_members(interaction.guild)
-    gd["inactivity_days"] = original
-
+    update_guild_settings(interaction.guild_id, inactivity_days=original)
     if not inactive:
         await interaction.followup.send(
             f"✅ No members inactive for **{override}+ days**. Nothing to do!", ephemeral=True)
         return
-
     if dry_run:
-        lines = [f"🔍 **Dry run — {len(inactive)} would be kicked ({override}+ days inactive):**\n"]
+        lines = [f"🔍 **Dry run — {len(inactive)} would be kicked ({override}+ days):**\n"]
         for member, last_seen in inactive[:25]:
-            days_ago = (datetime.now(timezone.utc) - last_seen).days
+            days_ago = (utcnow() - last_seen).days
             lines.append(f"• {member.mention} — {days_ago}d ago")
         if len(inactive) > 25:
             lines.append(f"…and **{len(inactive) - 25}** more.")
         await interaction.followup.send("\n".join(lines), ephemeral=True)
         return
-
-    kicked, failed = 0, 0
-    fail_list = []
+    kicked, failed, fail_list = 0, 0, []
     for member, last_seen in inactive:
-        days_ago = (datetime.now(timezone.utc) - last_seen).days
+        days_ago = (utcnow() - last_seen).days
         try:
             await member.kick(reason=f"[InactivityGuard] Inactive for {days_ago} days.")
             kicked += 1
             await send_log(interaction.guild,
                 f"👢 Kicked **{member}** — last seen **{days_ago}d ago** "
-                f"({last_seen.strftime('%Y-%m-%d')}) — kicked by {interaction.user.mention}")
+                f"({last_seen.strftime('%Y-%m-%d')}) — by {interaction.user.mention}")
         except discord.Forbidden:
             failed += 1
             fail_list.append(str(member))
         except Exception as e:
             failed += 1
             fail_list.append(f"{member} ({e})")
-        await asyncio.sleep(0.5)  # rate-limit safety
-
+        await asyncio.sleep(0.5)
     lines = [f"✅ Kicked **{kicked}** member(s) inactive for **{override}+ days**."]
     if failed:
         lines.append(f"⚠️ Failed to kick **{failed}**: {', '.join(fail_list[:5])}")
     await interaction.followup.send("\n".join(lines), ephemeral=True)
 
 
-# /last_seen
 @bot.tree.command(name="last_seen", description="Check when a specific member was last active.")
 @app_commands.describe(member="The member to look up.")
 @app_commands.checks.has_permissions(administrator=True)
 async def last_seen_cmd(interaction: discord.Interaction, member: discord.Member):
-    gd = guild_data(data, interaction.guild_id)
-    iso = gd["users"].get(str(member.id))
-    if iso:
-        dt = iso_to_dt(iso)
-        days_ago = (datetime.now(timezone.utc) - dt).days
+    dt = get_last_seen(interaction.guild_id, member.id)
+    if dt:
+        days_ago = (utcnow() - dt).days
         await interaction.response.send_message(
             f"🕒 **{member}** was last seen **{days_ago}d ago** (`{dt.strftime('%Y-%m-%d %H:%M UTC')}`).",
             ephemeral=True)
     elif member.joined_at:
-        # Fall back to join date — bot hasn't seen any activity yet
         dt = member.joined_at
-        days_ago = (datetime.now(timezone.utc) - dt).days
-        # Save it so future checks work
-        gd["users"][str(member.id)] = dt.isoformat()
-        save_data(data)
+        days_ago = (utcnow() - dt).days
+        set_last_seen(interaction.guild_id, member.id, dt)
         await interaction.response.send_message(
             f"🕒 **{member}** — no tracked activity yet. "
             f"Joined **{days_ago}d ago** (`{dt.strftime('%Y-%m-%d')}`) — using join date as baseline.",
             ephemeral=True)
     else:
-        await interaction.response.send_message(
-            f"❓ No data available for **{member}**.", ephemeral=True)
+        await interaction.response.send_message(f"❓ No data available for **{member}**.", ephemeral=True)
 
 
-# /reset_activity
 @bot.tree.command(name="reset_activity", description="Manually reset a member's last-seen timestamp to now.")
 @app_commands.describe(member="The member whose activity to reset.")
 @app_commands.checks.has_permissions(administrator=True)
 async def reset_activity(interaction: discord.Interaction, member: discord.Member):
-    update_user_activity(interaction.guild_id, member.id)
-    await interaction.response.send_message(
-        f"✅ Reset **{member}**'s last-seen to now.", ephemeral=True)
+    set_last_seen(interaction.guild_id, member.id)
+    await interaction.response.send_message(f"✅ Reset **{member}**'s last-seen to now.", ephemeral=True)
 
 
-# /help_guard
 @bot.tree.command(name="help_guard", description="Show all InactivityGuard commands.")
 async def help_guard(interaction: discord.Interaction):
     lines = [
@@ -521,7 +464,7 @@ async def help_guard(interaction: discord.Interaction):
         "**Setup**",
         "`/setup [inactivity_days] [log_channel]` — Initial configuration.",
         "`/set_threshold <days>` — Change the inactivity threshold.",
-        "`/set_log_channel [channel]` — Set or clear the log channel (enables auto-kick).",
+        "`/set_log_channel [channel]` — Set or clear the log channel.",
         "`/exempt_role <role> <add|remove>` — Protect a role from kicks.",
         "",
         "**Inspection**",
@@ -536,7 +479,6 @@ async def help_guard(interaction: discord.Interaction):
         "**Activity tracking**",
         "• Sending any message → resets timer",
         "• Joining / switching voice channel → resets timer",
-        "• Bot joins / member joins → recorded",
         f"• Auto-check runs every **{AUTO_CHECK_INTERVAL_HOURS}h** when a log channel is set.",
     ]
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
@@ -544,7 +486,9 @@ async def help_guard(interaction: discord.Interaction):
 
 
 if __name__ == "__main__":
-    if TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print("⚠️  Set your bot token in the TOKEN variable or DISCORD_TOKEN env var before running.")
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        print("⚠️  Set SUPABASE_URL and SUPABASE_KEY env vars before running.")
+    elif TOKEN == "YOUR_BOT_TOKEN_HERE":
+        print("⚠️  Set DISCORD_TOKEN env var before running.")
     else:
         bot.run(TOKEN)
