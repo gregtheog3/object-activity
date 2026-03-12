@@ -157,7 +157,7 @@ async def on_ready():
     data = load_data()
     print(f"[InactivityGuard] Logged in as {bot.user} (ID: {bot.user.id})")
 
-    # Seed join dates for members we've never seen
+    # Seed join dates for all members we haven't tracked yet
     for guild in bot.guilds:
         gd = guild_data(data, guild.id)
         changed = False
@@ -165,11 +165,13 @@ async def on_ready():
             if member.bot:
                 continue
             uid = str(member.id)
+            # Always seed if missing — join date is better than nothing
             if uid not in gd["users"] and member.joined_at:
                 gd["users"][uid] = member.joined_at.isoformat()
                 changed = True
         if changed:
             save_data(data)
+        print(f"  • {guild.name} — seeded {sum(1 for m in guild.members if not m.bot)} members")
         print(f"  • {guild.name} — tracking {len(gd['users'])} members, "
               f"threshold: {gd['inactivity_days']}d")
 
@@ -485,9 +487,20 @@ async def last_seen_cmd(interaction: discord.Interaction, member: discord.Member
         await interaction.response.send_message(
             f"🕒 **{member}** was last seen **{days_ago}d ago** (`{dt.strftime('%Y-%m-%d %H:%M UTC')}`).",
             ephemeral=True)
+    elif member.joined_at:
+        # Fall back to join date — bot hasn't seen any activity yet
+        dt = member.joined_at
+        days_ago = (datetime.now(timezone.utc) - dt).days
+        # Save it so future checks work
+        gd["users"][str(member.id)] = dt.isoformat()
+        save_data(data)
+        await interaction.response.send_message(
+            f"🕒 **{member}** — no tracked activity yet. "
+            f"Joined **{days_ago}d ago** (`{dt.strftime('%Y-%m-%d')}`) — using join date as baseline.",
+            ephemeral=True)
     else:
         await interaction.response.send_message(
-            f"❓ No activity recorded for **{member}** since tracking began.", ephemeral=True)
+            f"❓ No data available for **{member}**.", ephemeral=True)
 
 
 # /reset_activity
