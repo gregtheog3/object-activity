@@ -24,7 +24,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
-TOKEN = os.getenv("DISCORD_TOKEN", "MTQ4MTczNjk3NjQzNTc3NzY2Ng.GJeawC.26mzqO6r4fj_i7zWx8AzNcTDPvUO-cI2N-Y8Js")
+TOKEN = os.getenv("DISCORD_TOKEN", "YOUR_BOT_TOKEN_HERE")
 DATA_FILE = Path("activity_data.json")
 
 # Default inactivity threshold (days) – changeable per-guild via /setup
