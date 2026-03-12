@@ -165,6 +165,8 @@ async def send_log(guild: discord.Guild, message: str) -> None:
 @bot.event
 async def on_ready():
     print(f"[InactivityGuard] Logged in as {bot.user} (ID: {bot.user.id})")
+    print(f"[InactivityGuard] Guilds visible: {len(bot.guilds)}")
+    await asyncio.sleep(5)
     for guild in bot.guilds:
         try:
             activity = get_all_activity(guild.id)
