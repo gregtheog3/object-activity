@@ -166,25 +166,24 @@ async def send_log(guild: discord.Guild, message: str) -> None:
 async def on_ready():
     print(f"[InactivityGuard] Logged in as {bot.user} (ID: {bot.user.id})")
     print(f"[InactivityGuard] Guilds visible: {len(bot.guilds)}")
-    await asyncio.sleep(5)
     for guild in bot.guilds:
-    try:
         try:
-            await asyncio.wait_for(guild.chunk(), timeout=30)
-        except asyncio.TimeoutError:
-            print(f"  • {guild.name} — chunk timed out, continuing anyway")
-        activity = get_all_activity(guild.id)
-        seeded = 0
-        for member in guild.members:
-            if member.bot:
-                continue
-            if str(member.id) not in activity and member.joined_at:
-                set_last_seen(guild.id, member.id, member.joined_at)
-                seeded += 1
-        settings = get_guild_settings(guild.id)
-        print(f"  • {guild.name} — seeded {seeded} members, threshold: {settings['inactivity_days']}d")
-    except Exception as e:
-        print(f"  • ERROR in {guild.name}: {e}")
+            try:
+                await asyncio.wait_for(guild.chunk(), timeout=30)
+            except asyncio.TimeoutError:
+                print(f"  • {guild.name} — chunk timed out, continuing anyway")
+            activity = get_all_activity(guild.id)
+            seeded = 0
+            for member in guild.members:
+                if member.bot:
+                    continue
+                if str(member.id) not in activity and member.joined_at:
+                    set_last_seen(guild.id, member.id, member.joined_at)
+                    seeded += 1
+            settings = get_guild_settings(guild.id)
+            print(f"  • {guild.name} — seeded {seeded} members, threshold: {settings['inactivity_days']}d")
+        except Exception as e:
+            print(f"  • ERROR in {guild.name}: {e}")
     try:
         synced = await bot.tree.sync()
         print(f"[InactivityGuard] Synced {len(synced)} slash commands.")
