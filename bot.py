@@ -154,7 +154,11 @@ async def on_ready():
 async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
-    await set_last_seen(message.guild.id, message.author.id)
+    try:
+        await set_last_seen(message.guild.id, message.author.id)
+        print(f"[activity] {message.author} sent a message — updated")
+    except Exception as e:
+        print(f"[activity] ERROR updating {message.author}: {e}")
     await bot.process_commands(message)
 
 @bot.event
@@ -201,11 +205,21 @@ async def auto_kick_check():
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    msg = None
     if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("❌ You need **Administrator** permission to use this command.", ephemeral=True)
+        msg = "❌ You need **Administrator** permission to use this command."
+    elif "Failed to convert" in str(error) or "TransformerError" in type(error).__name__:
+        msg = "❌ Couldn't find that member — make sure you **select them from the dropdown** instead of typing manually."
     else:
-        await interaction.response.send_message(f"❌ Error: {error}", ephemeral=True)
+        msg = f"❌ Error: {error}"
         raise error
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+    except Exception:
+        pass
 
 @bot.tree.command(name="setup", description="Configure InactivityGuard for this server.")
 @app_commands.describe(inactivity_days="Days of inactivity before kicking.", log_channel="Channel for kick logs (enables auto-kick).")
