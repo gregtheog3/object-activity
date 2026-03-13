@@ -169,6 +169,7 @@ async def on_ready():
     await asyncio.sleep(5)
     for guild in bot.guilds:
         try:
+            await guild.chunk()  # force load all members
             activity = get_all_activity(guild.id)
             seeded = 0
             for member in guild.members:
